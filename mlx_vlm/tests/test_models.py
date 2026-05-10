@@ -1271,12 +1271,13 @@ class TestModels(unittest.TestCase):
                     {
                         "model_type": model_module.__name__.rsplit(".", 1)[-1],
                         "text_config": {},
-                        "vision_config": {},
+                        "vision_config": {"patch_size": 16},
                         "quantization": quantization,
                         "quantization_config": quantization,
                     }
                 )
 
+                self.assertEqual(config.vision_config.patch_size, 16)
                 self.assertIn(
                     "language_model.model.layers.0.linear_attn.in_proj_qkv",
                     config.quantization,
@@ -1351,9 +1352,10 @@ class TestModels(unittest.TestCase):
                     {
                         "model_type": model_module.__name__.rsplit(".", 1)[-1],
                         "text_config": {"eos_token_id": 248044},
-                        "vision_config": {},
+                        "vision_config": {"patch_size": 16},
                     }
                 )
+                self.assertEqual(config_from_dict.vision_config.patch_size, 16)
                 self.assertEqual(config_from_dict.eos_token_id, [248044, 248046])
 
                 explicit = model_module.ModelConfig(
@@ -1403,6 +1405,22 @@ class TestModels(unittest.TestCase):
             num_position_embeddings=144,
             deepstack_visual_indexes=[],
         )
+
+        config_from_dict = qwen3_vl_moe.ModelConfig.from_dict(
+            {
+                "model_type": "qwen3_vl_moe",
+                "text_config": vars(text_config).copy(),
+                "vision_config": {**vars(vision_config), "patch_size": 16},
+                "image_token_id": 151655,
+                "video_token_id": 151656,
+                "vocab_size": 10_000,
+            }
+        )
+        self.assertIsInstance(config_from_dict.text_config, qwen3_vl_moe.TextConfig)
+        self.assertIsInstance(config_from_dict.vision_config, qwen3_vl_moe.VisionConfig)
+        self.assertEqual(config_from_dict.vision_config.patch_size, 16)
+        model_from_dict = qwen3_vl_moe.Model(config_from_dict)
+        self.assertEqual(model_from_dict.vision_tower.patch_embed.patch_size, 16)
 
         config = qwen3_vl_moe.ModelConfig(
             text_config=text_config,
@@ -1825,6 +1843,53 @@ class TestModels(unittest.TestCase):
 
         # TODO: Add vision test runner for lfm2_vl
         # Rewrite inputs to be defined by the test classes
+
+    def test_lfm2_vl_initializes_projector_layernorm_even_when_disabled(self):
+        from mlx_vlm.models import lfm2_vl
+
+        text_config = lfm2_vl.TextConfig(layer_types=["full_attention"])
+        vision_config = lfm2_vl.VisionConfig()
+        config = lfm2_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            projector_use_layernorm=False,
+        )
+        model = lfm2_vl.Model(config)
+
+        self.assertIsInstance(model.multi_modal_projector.layer_norm, nn.LayerNorm)
+        self.assertIn("weight", model.multi_modal_projector.layer_norm.parameters())
+        self.assertIn("bias", model.multi_modal_projector.layer_norm.parameters())
+
+    def test_lfm2_vl_projector_skips_disabled_layernorm_branch(self):
+        from mlx_vlm.models import lfm2_vl
+        from mlx_vlm.models.lfm2_vl.lfm2_vl import Lfm2VlMultiModalProjector
+
+        class ExplodingLayerNorm(nn.Module):
+            def __call__(self, x):
+                raise AssertionError("layernorm branch should be disabled")
+
+        text_config = lfm2_vl.TextConfig(
+            hidden_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            intermediate_size=8,
+            layer_types=["full_attention"],
+        )
+        vision_config = lfm2_vl.VisionConfig(hidden_size=2)
+        config = lfm2_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            downsample_factor=1,
+            projector_hidden_size=3,
+            projector_use_layernorm=False,
+        )
+        projector = Lfm2VlMultiModalProjector(config)
+        projector.layer_norm = ExplodingLayerNorm()
+
+        output = projector(mx.zeros((1, 1, 1, 2)))
+
+        self.assertEqual(output.shape, (1, 1, 1, 4))
 
     def test_mllama(self):
         from mlx_vlm.models import mllama
