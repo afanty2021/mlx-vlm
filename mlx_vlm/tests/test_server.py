@@ -1,3 +1,4 @@
+import base64
 import json
 import time
 from queue import Queue
@@ -858,6 +859,120 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
     assert captured["args"].min_p == 0.08
     assert captured["args"].repetition_penalty == 1.15
     assert captured["args"].logit_bias == {12: -1.5}
+
+
+@pytest.mark.parametrize(
+    "audio_data_factory",
+    [
+        lambda raw: base64.b64encode(raw).decode("ascii"),
+        lambda raw: f"data:audio/wav;base64,{base64.b64encode(raw).decode('ascii')}",
+    ],
+)
+def test_chat_completions_decodes_input_audio_base64(client, audio_data_factory):
+    raw_audio = b"RIFF$\x00\x00\x00WAVEfmt "
+    captured = {}
+
+    def fake_generate(prompt, images=None, audio=None, **kwargs):
+        captured["audio"] = audio
+        return SimpleNamespace(
+            text="audio ok",
+            prompt_tokens=8,
+            generation_tokens=4,
+            total_tokens=12,
+            prompt_tps=10.0,
+            generation_tps=5.0,
+            peak_memory=0.1,
+        )
+
+    with (
+        patch.object(
+            server,
+            "get_cached_model",
+            return_value=(
+                SimpleNamespace(),
+                SimpleNamespace(),
+                SimpleNamespace(model_type="qwen2_vl"),
+            ),
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", side_effect=fake_generate),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe the audio."},
+                            {
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": audio_data_factory(raw_audio),
+                                    "format": "wav",
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured["audio"][0].getvalue() == raw_audio
+
+
+def test_chat_completions_preserves_input_audio_references(client):
+    audio_path = "/tmp/audio.wav"
+    captured = {}
+
+    def fake_generate(prompt, images=None, audio=None, **kwargs):
+        captured["audio"] = audio
+        return SimpleNamespace(
+            text="audio ok",
+            prompt_tokens=8,
+            generation_tokens=4,
+            total_tokens=12,
+            prompt_tps=10.0,
+            generation_tps=5.0,
+            peak_memory=0.1,
+        )
+
+    with (
+        patch.object(
+            server,
+            "get_cached_model",
+            return_value=(
+                SimpleNamespace(),
+                SimpleNamespace(),
+                SimpleNamespace(model_type="qwen2_vl"),
+            ),
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", side_effect=fake_generate),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe the audio."},
+                            {
+                                "type": "input_audio",
+                                "input_audio": {"data": audio_path, "format": "wav"},
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured["audio"] == [audio_path]
 
 
 def test_chat_completions_endpoint_flattens_text_content_parts(client):
@@ -1966,7 +2081,7 @@ class TestResponseGenerator:
                 (str(uid * 10 + 1), "length"),
             ]
 
-    def test_step_attaches_prompt_tps_from_prompt_progress(self):
+    def test_step_attaches_prompt_metrics_from_prompt_progress(self):
         class SimpleTokenizer:
             vocab = {"hi": 0}
 
@@ -1976,7 +2091,7 @@ class TestResponseGenerator:
         class PromptProgressBatch:
             def next(self, **kwargs):
                 return (
-                    [SimpleNamespace(uid=1, prompt_tps=184.431)],
+                    [SimpleNamespace(uid=1, prompt_tps=184.431, cached_tokens=7)],
                     [
                         SimpleNamespace(
                             uid=1,
@@ -2001,6 +2116,7 @@ class TestResponseGenerator:
                     server.make_streaming_detokenizer(processor),
                 ),
                 "prompt_tps": None,
+                "cached_tokens": 0,
             }
         }
 
@@ -2008,6 +2124,7 @@ class TestResponseGenerator:
 
         item = rqueue.get()
         assert item.prompt_tps == pytest.approx(184.431)
+        assert item.cached_tokens == 7
         assert rqueue.get() is None
 
     def test_generate_arguments_to_generate_kwargs(self):
