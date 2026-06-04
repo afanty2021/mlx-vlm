@@ -3,6 +3,7 @@ import gc
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from threading import Lock
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import mlx.core as mx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
+from huggingface_hub.errors import CacheNotFound
 
 from .. import apc as _apc
 from ..generate import (
@@ -41,6 +43,7 @@ from .generation import (
     get_top_logprobs_k,
 )
 from .openai import register_routes as register_openai_routes
+from .responses_state import _split_thinking as _split_thinking_text
 from .runtime import runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
 
@@ -113,6 +116,8 @@ def _build_gen_args(
         top_p=getattr(request, "top_p", DEFAULT_TOP_P),
         top_k=getattr(request, "top_k", 0),
         min_p=getattr(request, "min_p", 0.0),
+        seed=getattr(request, "seed", None),
+        logprobs=bool(getattr(request, "logprobs", False)),
         repetition_penalty=getattr(request, "repetition_penalty", None),
         repetition_context_size=_request_field_or_default(
             request,
@@ -244,9 +249,20 @@ def _build_structured_logits_processors(request, processor):
     return [logits_processor]
 
 
-def _count_thinking_tag_tokens(text: str) -> int:
+def _count_thinking_tag_tokens(
+    text: str,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> int:
     """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
     count = 0
+    if (
+        thinking_start_token
+        and thinking_end_token
+        and thinking_start_token in text
+        and thinking_end_token in text
+    ):
+        return 2
     # <|channel>thought (2 tokens) + <channel|> (1 token) + EOS (1 token)
     if "<|channel>thought" in text and "<channel|>" in text:
         count = 4
@@ -255,32 +271,13 @@ def _count_thinking_tag_tokens(text: str) -> int:
     return count
 
 
-def _split_thinking(text: str) -> Tuple[Optional[str], str]:
+def _split_thinking(
+    text: str,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
-    # Handle <|channel>thought...<channel|> format (gemma4)
-    # Also handle partial tag: text starting with "thought\n" (continuation)
-    if "<|channel>thought" in text or (
-        "<channel|>" in text and text.lstrip().startswith("thought")
-    ):
-        parts = text.split("<channel|>", 1)
-        if len(parts) == 2:
-            reasoning = (
-                parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
-            )
-            content = parts[1].strip()
-            return reasoning or None, content
-        reasoning = parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
-        return reasoning or None, ""
-    # Handle <think>...</think> format (qwen3.5 etc)
-    # Also handle partial: output starts with thinking text + </think> (no opening tag)
-    if "<think>" in text or "</think>" in text:
-        parts = text.split("</think>", 1)
-        if len(parts) == 2:
-            reasoning = parts[0].replace("<think>", "").strip()
-            content = parts[1].strip()
-            return reasoning or None, content
-        return parts[0].replace("<think>", "").strip(), ""
-    return None, text
+    return _split_thinking_text(text, thinking_start_token, thinking_end_token)
 
 
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
@@ -608,15 +605,25 @@ def models_endpoint():
         )
         return required_files.issubset(file_names) and has_weights
 
-    # Scan the cache directory for downloaded mlx models
-    hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
-    downloaded_models = [repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)]
+    # Scan the cache directory for downloaded mlx models when it exists.
+    try:
+        hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
+        downloaded_models = [
+            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
+        ]
+    except CacheNotFound:
+        downloaded_models = []
 
     # Create a list of available models
     models = [
         {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
         for repo in downloaded_models
     ]
+    loaded_model = runtime.model_cache.get("model_path")
+    if loaded_model and all(model["id"] != loaded_model for model in models):
+        models.append(
+            {"id": loaded_model, "object": "model", "created": int(time.time())}
+        )
 
     response = {"object": "list", "data": models}
 
