@@ -1700,6 +1700,90 @@ class TestErnie4_5VLProcessor(_ProcessorTestBase, unittest.TestCase):
         )
 
 
+class TestPaddleOCRVLProcessor(unittest.TestCase):
+    """Regression tests for PaddleOCR-VL processor loading."""
+
+    def test_from_pretrained_loads_preprocessor_geometry(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.paddleocr_vl.processing_paddleocr_vl import (
+            PaddleOCRVLProcessor,
+        )
+
+        def _fake_init(
+            self,
+            image_processor=None,
+            tokenizer=None,
+            chat_template=None,
+            **kwargs,
+        ):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.chat_template = chat_template
+            self.image_token = (
+                "<|IMAGE_PLACEHOLDER|>"
+                if not hasattr(tokenizer, "image_token")
+                else tokenizer.image_token
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "config.json").write_text(
+                json.dumps({"model_type": "paddleocr_vl"})
+            )
+            (path / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "min_pixels": 64,
+                        "max_pixels": 4096,
+                        "patch_size": 16,
+                        "temporal_patch_size": 2,
+                        "merge_size": 4,
+                        "image_mean": [0.1, 0.2, 0.3],
+                        "image_std": [0.9, 0.8, 0.7],
+                        "do_convert_rgb": False,
+                    }
+                )
+            )
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(image_token="<paddle-image>"),
+                ),
+                patch.object(PaddleOCRVLProcessor, "__init__", _fake_init),
+            ):
+                processor = PaddleOCRVLProcessor.from_pretrained(tmpdir)
+
+        self.assertEqual(processor.image_token, "<paddle-image>")
+        self.assertEqual(processor.image_processor.min_pixels, 64)
+        self.assertEqual(processor.image_processor.max_pixels, 4096)
+        self.assertEqual(processor.image_processor.patch_size, 16)
+        self.assertEqual(processor.image_processor.temporal_patch_size, 2)
+        self.assertEqual(processor.image_processor.merge_size, 4)
+        self.assertEqual(processor.image_processor.image_mean, [0.1, 0.2, 0.3])
+        self.assertEqual(processor.image_processor.image_std, [0.9, 0.8, 0.7])
+        self.assertFalse(processor.image_processor.do_convert_rgb)
+
+    def test_load_image_processor_returns_none(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.utils import load_image_processor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "config.json").write_text(
+                json.dumps({"model_type": "paddleocr_vl"})
+            )
+            image_processor = load_image_processor(path)
+
+        self.assertIsNone(image_processor)
+
+
 class TestToMlxHelper(unittest.TestCase):
     def test_converts_lists_and_numpy(self):
         import mlx.core as mx
@@ -1730,6 +1814,28 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(_num_image_tokens_from_patch_grid(23, 43, 2), 264)
         self.assertEqual(_num_image_tokens_from_patch_grid(1, 1, 2), 1)
         self.assertEqual(_num_image_tokens_from_patch_grid(7, 9, 4), 6)
+
+    def test_numpy_image_processor_outputs_packed_patches(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
+            Lfm2VlNumpyImageProcessor,
+            _num_image_tokens_from_patch_grid,
+        )
+
+        processor = Lfm2VlNumpyImageProcessor(
+            encoder_patch_size=16,
+            downsample_factor=2,
+            min_image_tokens=64,
+            max_image_tokens=256,
+            max_num_patches=1024,
+        )
+
+        result = processor(_make_image(), return_tensors="np")
+
+        self.assertEqual(result["pixel_values"].shape, (1, 1024, 768))
+        self.assertEqual(result["pixel_attention_mask"].shape, (1, 1024))
+        self.assertEqual(result["spatial_shapes"].tolist(), [[16, 16]])
+        self.assertEqual(int(result["pixel_attention_mask"].sum()), 256)
+        self.assertEqual(_num_image_tokens_from_patch_grid(16, 16, 2), 64)
 
     def test_scalar_image_rows_and_cols_are_supported(self):
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import _patched_call
@@ -1785,19 +1891,22 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            (Path(tmpdir) / "preprocessor_config.json").write_text(
+            (Path(tmpdir) / "processor_config.json").write_text(
                 json.dumps(
                     {
-                        "image_processor_type": "Lfm2VlImageProcessorFast",
-                        "do_resize": False,
-                        "do_image_splitting": True,
-                        "do_normalize": True,
-                        "do_rescale": True,
-                        "image_mean": [0.5, 0.5, 0.5],
-                        "image_std": [0.5, 0.5, 0.5],
-                        "max_num_patches": 1024,
-                        "patch_size": 16,
-                        "return_row_col_info": True,
+                        "image_processor": {
+                            "image_processor_type": "Lfm2VlImageProcessorFast",
+                            "do_resize": False,
+                            "do_image_splitting": True,
+                            "do_normalize": True,
+                            "do_rescale": True,
+                            "image_mean": [0.5, 0.5, 0.5],
+                            "image_std": [0.5, 0.5, 0.5],
+                            "max_num_patches": 1024,
+                            "patch_size": 16,
+                            "return_row_col_info": True,
+                        },
+                        "processor_class": "Lfm2VlProcessor",
                     }
                 )
             )
@@ -2046,6 +2155,16 @@ class TestErnie4_5VLPatch(unittest.TestCase):
             "ernie4_5_moe_vl",
             "mlx_vlm.models.ernie4_5_moe_vl",
             "Ernie4_5_VLProcessor",
+        )
+
+
+class TestPaddleOCRVLPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "paddleocr_vl",
+            "mlx_vlm.models.paddleocr_vl",
+            "PaddleOCRVLProcessor",
         )
 
 

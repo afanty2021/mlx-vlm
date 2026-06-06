@@ -1,14 +1,18 @@
 # PaddleOCR-VL
 
-PaddleOCR-VL 是百度 PaddlePaddle 生态的 OCR 视觉语言模型。
+PaddleOCR-VL is a vision-language OCR model from PaddlePaddle focused on document understanding tasks such as plain OCR, table recognition, formula recognition, and chart understanding.
 
-## 模型
+This MLX-VLM integration includes:
+- custom processor registration for `paddleocr_vl`
+- loading image geometry from `preprocessor_config.json`
+- prompt formatting through `apply_chat_template`
 
-| 模型 | 参数 | 显存 | 视觉 |
-|------|------|------|------|
-| `PaddlePaddle/PaddleOCR-VL` | 需确认 | ~5 GB | Yes |
+## Model
 
-## 安装
+- Hugging Face ID: `PaddlePaddle/PaddleOCR-VL`
+- Best for: OCR, tables, formulas, charts, and structured document extraction
+
+## Install
 
 ```sh
 pip install -U mlx-vlm
@@ -16,12 +20,48 @@ pip install -U mlx-vlm
 
 ## CLI
 
+### Basic OCR
+
 ```sh
-python -m mlx_vlm.generate \
+uv run mlx_vlm.generate \
   --model PaddlePaddle/PaddleOCR-VL \
-  --image path/to/text_image.jpg \
-  --prompt "Extract all text from this image." \
-  --max-tokens 500
+  --image /path/to/document.png \
+  --prompt "OCR:" \
+  --max-tokens 512 \
+  --temperature 0
+```
+
+### Table recognition
+
+```sh
+uv run mlx_vlm.generate \
+  --model PaddlePaddle/PaddleOCR-VL \
+  --image /path/to/table.png \
+  --prompt "Table Recognition:" \
+  --max-tokens 1024 \
+  --temperature 0
+```
+
+### Formula recognition
+
+```sh
+uv run mlx_vlm.generate \
+  --model PaddlePaddle/PaddleOCR-VL \
+  --image /path/to/formula.png \
+  --prompt "Formula Recognition:" \
+  --max-tokens 512 \
+  --temperature 0
+```
+
+### Chart understanding
+
+```sh
+uv run mlx_vlm.generate \
+  --model PaddlePaddle/PaddleOCR-VL \
+  --image /path/to/chart.png \
+  --prompt "Chart Recognition:" \
+  --max-tokens 1024 \
+  --temperature 0
 ```
 
 ## Python
@@ -32,24 +72,34 @@ from mlx_vlm.prompt_utils import apply_chat_template
 
 model, processor = load("PaddlePaddle/PaddleOCR-VL")
 
-image = ["path/to/image.jpg"]
-prompt = apply_chat_template(
-    processor, model.config, "Extract text",
-    num_images=1,
+image = ["/path/to/document.png"]
+prompt = "OCR:"
+
+formatted_prompt = apply_chat_template(
+    processor,
+    model.config,
+    prompt,
+    num_images=len(image),
 )
 
 result = generate(
     model=model,
     processor=processor,
-    prompt=prompt,
+    prompt=formatted_prompt,
     image=image,
-    max_tokens=500,
+    max_tokens=512,
+    temperature=0.0,
 )
-print(result)
+print(result.text)
 ```
 
-## 注意事项
+## Prompt Notes
 
-- 专注 OCR 任务
-- 多语言文本识别
-- PaddlePaddle 生态
+- `OCR:` is the default prompt for plain text extraction.
+- Other common task prompts are `Table Recognition:`, `Formula Recognition:`, and `Chart Recognition:`.
+- For structured extraction, you can provide a task-specific instruction or schema in the prompt.
+
+## Notes
+
+- You usually should not manually add image placeholder tokens when using `apply_chat_template`.
+- Local image paths and image URLs can both be used as inputs.

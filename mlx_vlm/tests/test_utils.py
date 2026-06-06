@@ -46,7 +46,10 @@ class MockTorch:
 
 
 class MockProcessor:
-    def __init__(self):
+    def __init__(self, tokenizer_return_value=None):
+        self.image_token = "<image>"
+        _return_value = tokenizer_return_value
+
         class DummyTokenizer:
             def __init__(self):
                 self.pad_token = None
@@ -63,6 +66,8 @@ class MockProcessor:
                 del text, add_special_tokens, padding, padding_side
                 if return_tensors != "mlx":
                     raise ValueError(f"Unsupported return_tensors: {return_tensors}")
+                if _return_value is not None:
+                    return _return_value
                 return SimpleNamespace(
                     input_ids=mx.array([[1, 2, 3]]),
                     attention_mask=mx.array([[7, 8, 9]]),
@@ -290,8 +295,12 @@ def test_convert_preserves_existing_deepseek_v4_quantization():
 def test_prepare_inputs():
     """Test prepare_inputs function."""
 
+    # Define tokenizer return values
+    tok_result = MagicMock()
+    tok_result.input_ids = [[1, 2, 3]]
+    tok_result.attention_mask = [7, 8, 9]
     # Mock processor
-    processor = MockProcessor()
+    processor = MockProcessor(tokenizer_return_value=tok_result)
 
     # Test text-only input
     inputs = prepare_inputs(
@@ -558,6 +567,73 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["group_size"] == 64
     assert quantize.call_args.kwargs["bits"] == 8
     assert quantize.call_args.kwargs["mode"] == "affine"
+
+
+def test_load_model_quantizes_projector_with_scales_when_skip_vision():
+    safe_open = MagicMock()
+    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
+
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeProjector(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear_1 = nn.Linear(64, 64, bias=False)
+
+    class FakeModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.vision_tower = nn.Linear(64, 64, bias=False)
+            self.multi_modal_projector = FakeProjector()
+            self.language_model = nn.Linear(64, 64, bias=False)
+
+        def load_weights(self, weights):
+            self.loaded_weights = weights
+
+    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+    weights = {
+        "language_model.weight": mx.zeros((64, 16), dtype=mx.uint32),
+        "language_model.scales": mx.zeros((64, 1), dtype=mx.float16),
+        "multi_modal_projector.linear_1.weight": mx.zeros((64, 16), dtype=mx.uint32),
+        "multi_modal_projector.linear_1.scales": mx.zeros((64, 1), dtype=mx.float16),
+        "vision_tower.weight": mx.zeros((64, 64), dtype=mx.float16),
+    }
+    selected = {}
+
+    def fake_quantize(model, *args, **kwargs):
+        predicate = kwargs["class_predicate"]
+        selected["language"] = predicate("language_model", model.language_model)
+        selected["projector"] = predicate(
+            "multi_modal_projector.linear_1",
+            model.multi_modal_projector.linear_1,
+        )
+        selected["vision"] = predicate("vision_tower", model.vision_tower)
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={
+                "model_type": "kimi_vl",
+                "quantization": {"group_size": 64, "bits": 8},
+                "vision_config": {"skip_vision": True},
+            },
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "kimi_vl"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize", side_effect=fake_quantize),
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+
+    assert selected == {"language": True, "projector": True, "vision": False}
 
 
 def test_load_delegates_adapter_loading_to_trainer_entrypoint():

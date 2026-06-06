@@ -1,14 +1,19 @@
-# ERNIE-4.5-MoE-VL
+# ERNIE 4.5 VL
 
-ERNIE-4.5-MoE-VL 是百度推出的混合专家视觉语言模型，结合 MoE 架构实现高效推理。
+ERNIE 4.5 VL is a multimodal MoE model from Baidu for image understanding and visual reasoning.
 
-## 模型
+This MLX-VLM integration includes:
+- an in-tree ERNIE tokenizer and processor
+- ERNIE-specific chat formatting handled by `apply_chat_template`
+- support for the ERNIE 4.5 VL architecture added to the standard `load()` and `generate()` flow
 
-| 模型 | 参数 | 显存 | 视觉 |
-|------|------|------|------|
-| `PaddlePaddle/ERNIE-4.5-MoE-VL` | 需确认 | ~25 GB | Yes |
+## Model
 
-## 安装
+- Hugging Face ID: `baidu/ERNIE-4.5-VL-28B-A3B-Thinking`
+- Architecture: multimodal MoE vision-language model
+- Best for: general image understanding, document analysis, charts, screenshots, and visually grounded question answering
+
+## Install
 
 ```sh
 pip install -U mlx-vlm
@@ -16,12 +21,26 @@ pip install -U mlx-vlm
 
 ## CLI
 
+### Image understanding
+
 ```sh
-python -m mlx_vlm.generate \
-  --model PaddlePaddle/ERNIE-4.5-MoE-VL \
-  --image path/to/image.jpg \
-  --prompt "描述这张图片" \
-  --max-tokens 500
+uv run mlx_vlm.generate \
+  --model baidu/ERNIE-4.5-VL-28B-A3B-Thinking \
+  --image /path/to/image.jpg \
+  --prompt "Describe this image." \
+  --max-tokens 512 \
+  --temperature 0
+```
+
+### Visual question answering
+
+```sh
+uv run mlx_vlm.generate \
+  --model baidu/ERNIE-4.5-VL-28B-A3B-Thinking \
+  --image /path/to/screenshot.png \
+  --prompt "What is the main action shown in this screenshot?" \
+  --max-tokens 512 \
+  --temperature 0
 ```
 
 ## Python
@@ -30,26 +49,31 @@ python -m mlx_vlm.generate \
 from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
 
-model, processor = load("PaddlePaddle/ERNIE-4.5-MoE-VL")
+model, processor = load("baidu/ERNIE-4.5-VL-28B-A3B-Thinking")
 
-image = ["path/to/image.jpg"]
-prompt = apply_chat_template(
-    processor, model.config, "描述这张图片",
-    num_images=1,
+image = ["/path/to/image.jpg"]
+prompt = "Describe the important details in this image."
+
+formatted_prompt = apply_chat_template(
+    processor,
+    model.config,
+    prompt,
+    num_images=len(image),
 )
 
 result = generate(
     model=model,
     processor=processor,
-    prompt=prompt,
+    prompt=formatted_prompt,
     image=image,
-    max_tokens=500,
+    max_tokens=512,
+    temperature=0.0,
 )
-print(result)
+print(result.text)
 ```
 
-## 注意事项
+## Notes
 
-- 百度官方 VLM
-- MoE 架构高效
-- 中文支持优秀
+- You usually should not manually add image placeholders when using `apply_chat_template`.
+- When you pass chat messages through MLX-VLM, the ERNIE-specific image message format is handled for you automatically.
+- Local image paths and image URLs can both be used as inputs.

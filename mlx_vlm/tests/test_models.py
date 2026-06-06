@@ -2306,7 +2306,7 @@ class TestModels(unittest.TestCase):
         # TODO: Add vision test runner for lfm2_vl
         # Rewrite inputs to be defined by the test classes
 
-    def test_lfm2_vl_initializes_projector_layernorm_even_when_disabled(self):
+    def test_lfm2_vl_skips_projector_layernorm_when_disabled(self):
         from mlx_vlm.models import lfm2_vl
 
         text_config = lfm2_vl.TextConfig(layer_types=["full_attention"])
@@ -2318,17 +2318,13 @@ class TestModels(unittest.TestCase):
         )
         model = lfm2_vl.Model(config)
 
-        self.assertIsInstance(model.multi_modal_projector.layer_norm, nn.LayerNorm)
-        self.assertIn("weight", model.multi_modal_projector.layer_norm.parameters())
-        self.assertIn("bias", model.multi_modal_projector.layer_norm.parameters())
+        self.assertIsNone(model.multi_modal_projector.layer_norm)
+        parameters = model.multi_modal_projector.parameters()
+        self.assertNotIn("layer_norm", parameters)
 
     def test_lfm2_vl_projector_skips_disabled_layernorm_branch(self):
         from mlx_vlm.models import lfm2_vl
         from mlx_vlm.models.lfm2_vl.lfm2_vl import Lfm2VlMultiModalProjector
-
-        class ExplodingLayerNorm(nn.Module):
-            def __call__(self, x):
-                raise AssertionError("layernorm branch should be disabled")
 
         text_config = lfm2_vl.TextConfig(
             hidden_size=4,
@@ -2347,7 +2343,6 @@ class TestModels(unittest.TestCase):
             projector_use_layernorm=False,
         )
         projector = Lfm2VlMultiModalProjector(config)
-        projector.layer_norm = ExplodingLayerNorm()
 
         output = projector(mx.zeros((1, 1, 1, 2)))
 
@@ -2938,6 +2933,70 @@ class TestModels(unittest.TestCase):
         self.assertEqual(
             output.logits.shape,
             (1, 6, config_with_audio.text_config.vocab_size),
+        )
+
+        shared_text_config = gemma4.TextConfig(
+            model_type="gemma4_text",
+            hidden_size=16,
+            num_hidden_layers=4,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            global_head_dim=8,
+            vocab_size=32,
+            vocab_size_per_layer_input=32,
+            hidden_size_per_layer_input=8,
+            num_kv_shared_layers=2,
+            sliding_window=32,
+            sliding_window_pattern=2,
+        )
+        shared_model = gemma4.Model(
+            gemma4.ModelConfig(
+                text_config=shared_text_config,
+                vision_config=vision_config,
+                model_type="gemma4",
+                vocab_size=config.vocab_size,
+                image_token_id=config.image_token_id,
+                audio_config=None,
+            )
+        )
+
+        weights = shared_model.sanitize(
+            {
+                "model.language_model.layers.1.self_attn.k_proj.weight": mx.zeros(
+                    (8, 16)
+                ),
+                "model.language_model.layers.2.self_attn.k_proj.weight": mx.zeros(
+                    (8, 16)
+                ),
+                "model.language_model.layers.2.self_attn.v_proj.weight": mx.zeros(
+                    (8, 16)
+                ),
+                "model.language_model.layers.2.self_attn.k_norm.weight": mx.zeros((8,)),
+                "model.language_model.layers.2.self_attn.q_proj.weight": mx.zeros(
+                    (16, 16)
+                ),
+                "model.language_model.layers.3.self_attn.v_proj.weight": mx.zeros(
+                    (8, 16)
+                ),
+            }
+        )
+        weights = shared_model.language_model.sanitize(weights)
+
+        self.assertIn("language_model.model.layers.1.self_attn.k_proj.weight", weights)
+        self.assertIn("language_model.model.layers.2.self_attn.q_proj.weight", weights)
+        self.assertNotIn(
+            "language_model.model.layers.2.self_attn.k_proj.weight", weights
+        )
+        self.assertNotIn(
+            "language_model.model.layers.2.self_attn.v_proj.weight", weights
+        )
+        self.assertNotIn(
+            "language_model.model.layers.2.self_attn.k_norm.weight", weights
+        )
+        self.assertNotIn(
+            "language_model.model.layers.3.self_attn.v_proj.weight", weights
         )
 
     def test_gemma4_unified(self):
