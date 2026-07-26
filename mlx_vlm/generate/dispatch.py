@@ -11,7 +11,6 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
-from mlx_lm.generate import maybe_quantize_kv_cache as mlx_maybe_quantize_kv_cache
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
@@ -261,8 +260,12 @@ def parse_arguments():
     parser.add_argument(
         "--diffusion-sampler",
         choices=["entropy-bound", "confidence-threshold"],
-        default="entropy-bound",
-        help="Canvas update sampler for diffusion generation.",
+        default="confidence-threshold",
+        help=(
+            "Canvas update sampler for diffusion generation. Use entropy-bound "
+            "for reference-style denoising; confidence-threshold is faster for "
+            "quantized block-diffusion checkpoints."
+        ),
     )
     parser.add_argument(
         "--threshold",
@@ -270,8 +273,9 @@ def parse_arguments():
         default=None,
         help=(
             "Token probability threshold for diffusion confidence transfer. "
-            "Default: 0.9 for confidence-threshold sampling; masked-diffusion "
-            "models use their checkpoint reference defaults."
+            f"Default: {DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD:g} for "
+            "confidence-threshold sampling; "
+            "masked-diffusion models use their checkpoint reference defaults."
         ),
     )
     parser.add_argument(
@@ -443,7 +447,19 @@ def parse_arguments():
     parser.add_argument(
         "--enable-thinking",
         action="store_true",
-        help="Enable thinking mode in the chat template (e.g. for Qwen3.5).",
+        help=(
+            "Enable thinking in the chat template. Templates that use "
+            "thinking_mode receive thinking_mode='enabled'."
+        ),
+    )
+    parser.add_argument(
+        "--thinking-mode",
+        choices=("enabled", "disabled", "adaptive"),
+        default=None,
+        help=(
+            "Set the chat-template thinking mode when supported. "
+            "Choices: enabled, disabled, adaptive."
+        ),
     )
     parser.add_argument(
         "--thinking-budget",
@@ -521,21 +537,26 @@ def maybe_quantize_kv_cache(
                 return tuple(quantize_entry(sub_entry) for sub_entry in entry)
             return entry
 
-        # Skip the last layer (before final norm/LM head) — it's highly
-        # sensitive to quantization in deep models (e.g. gemma-4-31b).
-        last_idx = len(prompt_cache) - 1 if len(prompt_cache) > 2 else -1
+        # Last-layer policy shared with _make_cache / APC warm restore.
+        n = len(prompt_cache)
         for index, layer_cache in enumerate(prompt_cache):
-            if index == last_idx:
+            if not cache.should_quantize_kv_layer(index, n):
                 continue
             prompt_cache[index] = quantize_entry(layer_cache)
         return
 
-    mlx_maybe_quantize_kv_cache(
-        prompt_cache,
-        quantized_kv_start=quantized_kv_start,
-        kv_group_size=kv_group_size,
-        kv_bits=int(kv_bits),
-    )
+    n = len(prompt_cache)
+    for index, layer_cache in enumerate(prompt_cache):
+        if not cache.should_quantize_kv_layer(index, n):
+            continue
+        if (
+            hasattr(layer_cache, "to_quantized")
+            and layer_cache.offset >= quantized_kv_start
+        ):
+            prompt_cache[index] = layer_cache.to_quantized(
+                group_size=kv_group_size,
+                bits=int(kv_bits),
+            )
 
 
 @contextlib.contextmanager
@@ -623,32 +644,14 @@ class PromptCacheState:
 
 from .common import GenerationResult, generation_stream, wired_limit
 from .diffusion import (
+    DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
     is_diffusion_model,
-    is_masked_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
-
-
-def is_masked_diffusion_text_model(model: nn.Module) -> bool:
-    return is_masked_diffusion_model(model)
-
-
-def _use_masked_diffusion_text_path(model: nn.Module, kwargs: Dict[str, Any]) -> bool:
-    if not is_masked_diffusion_text_model(model):
-        return False
-
-    config = getattr(model, "config", None)
-    if getattr(config, "default_generation_mode", None) != "ar":
-        return True
-
-    generation_mode = kwargs.get("generation_mode")
-    if generation_mode is not None:
-        return generation_mode != "ar"
-
-    return False
+from .types import GenerateKwargs, ProcessorLike, Unpack
 
 
 def _prime_cached_prefix_rope_state(
@@ -696,13 +699,13 @@ from .ar import generate_step
 
 def stream_generate(
     model: nn.Module,
-    processor: PreTrainedTokenizer,
+    processor: ProcessorLike | PreTrainedTokenizer,
     prompt: str,
-    image: Union[str, List[str]] = None,
-    audio: Union[str, List[str]] = None,
-    video: Union[str, List[str]] = None,
-    **kwargs,
-) -> Union[str, Generator[str, None, None]]:
+    image: Union[str, List[str], None] = None,
+    audio: Union[str, List[str], None] = None,
+    video: Union[str, List[str], None] = None,
+    **kwargs: Unpack[GenerateKwargs],
+) -> Generator[GenerationResult, None, None]:
     """
     A generator producing text based on the given prompt from the model.
 
@@ -783,107 +786,18 @@ def stream_generate(
         }
         kwargs.update(data_kwargs)
 
-    if _use_masked_diffusion_text_path(model, kwargs):
-        if image is not None or audio is not None or video is not None:
-            raise ValueError("Diffusion text generation models are text-only.")
-
-        max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
-        temperature = kwargs.get("temperature", DEFAULT_TEMPERATURE)
-        top_p = kwargs.get("top_p", DEFAULT_TOP_P)
-        top_k = kwargs.get("top_k", DEFAULT_TOP_K)
-        max_denoising_steps = kwargs.get("max_denoising_steps")
-        if max_denoising_steps is None:
-            config = getattr(model, "config", None)
-            max_denoising_steps = kwargs.get(
-                "steps", getattr(config, "default_diffusion_steps", 32)
-            )
-        config = getattr(model, "config", None)
-        # Sampler knobs resolve as: explicit kwarg > config default_diffusion_*
-        # attribute > the model generate()'s own reference defaults (omitted
-        # here). Forcing shared defaults broke checkpoints whose reference
-        # generation differs (e.g. LLaDA2.0 corrupts with editing enabled).
-        tuned_kwargs = {}
-        for key, config_attr in (
-            ("threshold", "default_diffusion_threshold"),
-            ("min_threshold", "default_diffusion_min_threshold"),
-            ("editing_threshold", "default_diffusion_editing_threshold"),
-            ("num_to_transfer", "default_diffusion_num_to_transfer"),
-            ("max_transfer_per_step", "default_diffusion_max_transfer_per_step"),
-            ("max_post_steps", "default_diffusion_max_post_steps"),
-            ("stability_steps", "default_diffusion_stability_steps"),
-        ):
-            value = kwargs.get(key)
-            if value is None:
-                value = getattr(config, config_attr, None)
-            if value is not None:
-                tuned_kwargs[key] = value
-
-        generation_stats = {}
-        handled_generation_kwargs = {
-            "max_tokens",
-            "temperature",
-            "top_p",
-            "top_k",
-            "max_denoising_steps",
-            "steps",
-            "block_length",
-            "threshold",
-            "min_threshold",
-            "editing_threshold",
-            "max_post_steps",
-            "num_to_transfer",
-            "max_transfer_per_step",
-            "stability_steps",
-        }
-        model_generate_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key not in handled_generation_kwargs
-        }
-        tic = time.perf_counter()
-        generated = model.language_model.generate(
+    if is_diffusion_model(model, kwargs):
+        yield from stream_diffusion_generate_from_kwargs(
+            model,
+            processor,
+            tokenizer,
             input_ids,
-            temperature=temperature,
-            block_length=kwargs.get("block_length", 32),
-            steps=max_denoising_steps,
-            gen_length=max_tokens,
-            top_p=None if top_p is None or top_p >= 1.0 else top_p,
-            top_k=None if top_k is None or top_k <= 0 else top_k,
-            eos_early_stop=True,
-            visualize=verbose,
-            tokenizer=tokenizer,
+            pixel_values,
+            mask,
+            skip_special_token_ids,
+            kwargs,
             skip_special_tokens=skip_special_tokens,
-            stats=generation_stats,
-            **tuned_kwargs,
-            **model_generate_kwargs,
-        )
-        mx.eval(generated)
-        total_time = time.perf_counter() - tic
-        prompt_time = generation_stats.get("prompt_time", 0.0)
-        prompt_tps = input_ids.size / prompt_time if prompt_time > 0 else 0.0
-        generation_time = max(total_time - prompt_time, 1e-9)
-        generated_tokens = generated[0].tolist()
-        text = tokenizer.decode(
-            generated_tokens, skip_special_tokens=skip_special_tokens
-        )
-
-        yield GenerationResult(
-            text=text,
-            token=generated_tokens[-1] if generated_tokens else None,
-            logprobs=None,
-            prompt_tokens=input_ids.size,
-            generation_tokens=len(generated_tokens),
-            total_tokens=input_ids.size + len(generated_tokens),
-            prompt_tps=prompt_tps,
-            generation_tps=len(generated_tokens) / generation_time,
-            peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason=(
-                "stop"
-                if generated_tokens
-                and tokenizer.stopping_criteria(generated_tokens[-1])
-                else "length"
-            ),
-            text_already_printed=bool(generation_stats.get("text_already_printed")),
+            verbose=verbose,
         )
         return
 
@@ -926,19 +840,6 @@ def stream_generate(
             multimodal_token_ids,
         )
 
-    if is_diffusion_model(model):
-        yield from stream_diffusion_generate_from_kwargs(
-            model,
-            processor,
-            tokenizer,
-            input_ids,
-            pixel_values,
-            mask,
-            skip_special_token_ids,
-            kwargs,
-        )
-        return
-
     if apc_manager is not None:
         apc_mode = _apc.model_apc_mode(model.language_model)
         if apc_mode is None:
@@ -946,7 +847,20 @@ def stream_generate(
 
     if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
-        apc_extra_hash = _apc.tenant_scoped_hash(apc_tenant, image_hash)
+        audio_features = kwargs.get("input_features")
+        video_features = kwargs.get("pixel_values_videos")
+        apc_extra_hash = _apc.semantic_extra_hash(
+            tenant=apc_tenant,
+            image_hash=image_hash,
+            media={
+                "audio": audio_features if audio_features is not None else audio,
+                "video": video_features if video_features is not None else video,
+                "embeddings": kwargs.get("inputs_embeds"),
+                "masks": mask,
+            },
+            model=model,
+            processor=processor,
+        )
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
@@ -975,99 +889,45 @@ def stream_generate(
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
     # PromptCacheState didn't already produce a hit.
     if apc_manager is not None and reused_prefix_len == 0:
-        if apc_mode == "exact":
-            exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
-                full_input_ids_list,
-                extra_hash=apc_extra_hash,
-                min_prefix_tokens=apc_safe_prefix_lookup_min,
-            )
-            if (
-                exact_prompt_cache is not None
-                and exact_prefix_len > 0
-                and exact_prefix_len < input_ids.shape[1]
-                and _apc_suffix_is_text_only(exact_prefix_len)
-                and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
-            ):
-                reused_prefix_len = exact_prefix_len
-                input_ids = input_ids[:, exact_prefix_len:]
+        plan = _apc.apc_lookup_plan(
+            apc_manager,
+            full_input_ids_list,
+            extra_hash=apc_extra_hash,
+            apc_mode=apc_mode,
+            safe_lookup_min=apc_safe_prefix_lookup_min,
+            suffix_is_text_only=_apc_suffix_is_text_only,
+            prefix_has_media=_apc_prefix_has_media_tokens,
+        )
+        if plan is not None:
+            plen = plan["prefix_len"]
+            warm_cache = plan.get("warm_cache")
+            matched_blocks = plan.get("matched_blocks") or []
+            primed = _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
+            if primed:
+                reused_prefix_len = plen
+                input_ids = input_ids[:, plen:]
                 pixel_values = None
                 kwargs.pop("cached_image_features", None)
-                kwargs["prompt_cache"] = exact_prompt_cache
-        else:
-            matched_blocks, prefix_len = apc_manager.lookup_prefix(
-                full_input_ids_list, extra_hash=apc_extra_hash
-            )
-            if prefix_len > 0 and _apc_prefix_has_media_tokens(prefix_len):
-                apc_manager.release(matched_blocks)
-                matched_blocks = []
-                prefix_len = 0
-            exact_prompt_cache = None
-            exact_prefix_len = 0
-            if prefix_len < input_ids.shape[1]:
-                exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
-                    full_input_ids_list,
-                    extra_hash=apc_extra_hash,
-                    min_prefix_tokens=max(prefix_len, apc_safe_prefix_lookup_min),
-                )
-            disk_prompt_cache = None
-            disk_prefix_len = 0
-            if max(prefix_len, exact_prefix_len) < input_ids.shape[1]:
-                disk_prompt_cache, disk_prefix_len = (
-                    apc_manager.lookup_prefix_disk_cache(
-                        full_input_ids_list,
-                        extra_hash=apc_extra_hash,
-                        min_prefix_tokens=max(
-                            prefix_len,
-                            exact_prefix_len,
-                            apc_safe_prefix_lookup_min,
-                        ),
-                        allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
-                    )
-                )
-            if (
-                disk_prefix_len > max(prefix_len, exact_prefix_len)
-                and disk_prefix_len < input_ids.shape[1]
-            ):
-                if matched_blocks:
-                    apc_manager.release(matched_blocks)
-                if _apc_suffix_is_text_only(
-                    disk_prefix_len
-                ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
-                    reused_prefix_len = disk_prefix_len
-                    input_ids = input_ids[:, disk_prefix_len:]
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
-                    kwargs["prompt_cache"] = disk_prompt_cache
-            elif (
-                exact_prefix_len > prefix_len and exact_prefix_len < input_ids.shape[1]
-            ):
-                if matched_blocks:
-                    apc_manager.release(matched_blocks)
-                if _apc_suffix_is_text_only(
-                    exact_prefix_len
-                ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
-                    reused_prefix_len = exact_prefix_len
-                    input_ids = input_ids[:, exact_prefix_len:]
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
-                    kwargs["prompt_cache"] = exact_prompt_cache
-            elif prefix_len > 0 and prefix_len < input_ids.shape[1]:
-                if _apc_suffix_is_text_only(
-                    prefix_len
-                ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                if warm_cache is not None:
+                    kwargs["prompt_cache"] = warm_cache
+                else:
                     apc_blocks_in_use = matched_blocks
-                    reused_prefix_len = prefix_len
-                    input_ids = input_ids[:, prefix_len:]
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
+                    _kv_bits = kwargs.get("kv_bits")
+                    _quant_cfg = (
+                        {
+                            "bits": _kv_bits,
+                            "group_size": kwargs.get("kv_group_size", 64),
+                            "scheme": kwargs.get("kv_quant_scheme"),
+                        }
+                        if _kv_bits is not None
+                        else None
+                    )
                     kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
                         matched_blocks,
-                        min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
+                        min_capacity_tokens=plen + input_ids.shape[1] + 1,
+                        kv_quant_config=_quant_cfg,
                     )
-                else:
-                    apc_manager.release(matched_blocks)
-            elif matched_blocks:
-                # Full match (no new tokens to compute) — release; fall through to normal path
+            elif warm_cache is None and matched_blocks:
                 apc_manager.release(matched_blocks)
 
     if thinking_budget is not None:
@@ -1231,30 +1091,14 @@ def stream_generate(
                     all_ids = full_input_ids_list + [
                         t.item() if hasattr(t, "item") else t for t in generated_tokens
                     ]
-                # Snapshot keys/values up to the live offset for each layer.
-                layer_keys: List[mx.array] = []
-                layer_values: List[mx.array] = []
-                ok = True
-                for c in tracked_cache:
-                    k = getattr(c, "keys", None)
-                    v = getattr(c, "values", None)
-                    off = getattr(c, "offset", None)
-                    if k is None or v is None or off is None:
-                        ok = False
-                        break
-                    layer_keys.append(k[..., :off, :])
-                    layer_values.append(v[..., :off, :])
-                if ok and layer_keys:
-                    new_blocks = apc_manager.store_kv_blocks(
-                        all_ids,
-                        layer_keys,
-                        layer_values,
-                        extra_hash=apc_extra_hash,
-                        skip_first_n_tokens=reused_prefix_len,
-                    )
-                    apc_manager.release(apc_blocks_in_use + new_blocks)
-                else:
-                    apc_manager.release(apc_blocks_in_use)
+                _apc.commit_prefix_blocks(
+                    apc_manager,
+                    tracked_cache,
+                    all_ids,
+                    extra_hash=apc_extra_hash,
+                    skip_first_n_tokens=reused_prefix_len,
+                    blocks_in_use=apc_blocks_in_use,
+                )
             except Exception as e:
                 logger.warning("APC store failed: %s", e)
                 apc_manager.release(apc_blocks_in_use)
@@ -1265,13 +1109,13 @@ def stream_generate(
 
 def generate(
     model: nn.Module,
-    processor: PreTrainedTokenizer,
+    processor: ProcessorLike | PreTrainedTokenizer,
     prompt: str,
-    image: Union[str, List[str]] = None,
-    audio: Union[str, List[str]] = None,
-    video: Union[str, List[str]] = None,
+    image: Union[str, List[str], None] = None,
+    audio: Union[str, List[str], None] = None,
+    video: Union[str, List[str], None] = None,
     verbose: bool = False,
-    **kwargs,
+    **kwargs: Unpack[GenerateKwargs],
 ) -> GenerationResult:
     """
     Generate text from the model.
@@ -1401,7 +1245,7 @@ def main():
         "diffusion_full_canvas": False,
         "diffusion_min_canvas_length": None,
         "diffusion_max_canvas_length": None,
-        "diffusion_sampler": "entropy-bound",
+        "diffusion_sampler": "confidence-threshold",
         "threshold": None,
         "min_threshold": None,
         "block_length": None,
@@ -1469,6 +1313,8 @@ def main():
     num_audios = len(args.audio) if args.audio is not None else 0
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    if args.thinking_mode is not None:
+        chat_template_kwargs["thinking_mode"] = args.thinking_mode
     if args.video:
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
@@ -1517,7 +1363,6 @@ def main():
         from ..vision_cache import VisionFeatureCache
 
         vision_cache = VisionFeatureCache()
-        is_masked_text_diffusion = is_masked_diffusion_text_model(model)
         chat = []
         if args.system:
             chat.append({"role": "system", "content": args.system})
@@ -1549,25 +1394,6 @@ def main():
                 stream_kwargs["resize_shape"] = args.resize_shape
             if args.prefill_step_size is not None:
                 stream_kwargs["prefill_step_size"] = args.prefill_step_size
-            if is_masked_text_diffusion:
-                if args.max_denoising_steps is not None:
-                    stream_kwargs["max_denoising_steps"] = args.max_denoising_steps
-                if args.block_length is not None:
-                    stream_kwargs["block_length"] = args.block_length
-                if args.num_to_transfer is not None:
-                    stream_kwargs["num_to_transfer"] = args.num_to_transfer
-                if args.max_transfer_per_step is not None:
-                    stream_kwargs["max_transfer_per_step"] = args.max_transfer_per_step
-                if args.threshold is not None:
-                    stream_kwargs["threshold"] = args.threshold
-                if args.min_threshold is not None:
-                    stream_kwargs["min_threshold"] = args.min_threshold
-                if args.editing_threshold is not None:
-                    stream_kwargs["editing_threshold"] = args.editing_threshold
-                if args.max_post_steps is not None:
-                    stream_kwargs["max_post_steps"] = args.max_post_steps
-                if args.stability_steps is not None:
-                    stream_kwargs["stability_steps"] = args.stability_steps
             stream_kwargs.update(diffusion_kwargs_from_args(args, config))
 
             diffusion_output = DiffusionOutputHandler(model, stream_kwargs, True)
@@ -1619,25 +1445,6 @@ def main():
             gen_kwargs["resize_shape"] = args.resize_shape
         if args.prefill_step_size is not None:
             gen_kwargs["prefill_step_size"] = args.prefill_step_size
-        if is_masked_diffusion_text_model(model):
-            if args.max_denoising_steps is not None:
-                gen_kwargs["max_denoising_steps"] = args.max_denoising_steps
-            if args.block_length is not None:
-                gen_kwargs["block_length"] = args.block_length
-            if args.num_to_transfer is not None:
-                gen_kwargs["num_to_transfer"] = args.num_to_transfer
-            if args.max_transfer_per_step is not None:
-                gen_kwargs["max_transfer_per_step"] = args.max_transfer_per_step
-            if args.threshold is not None:
-                gen_kwargs["threshold"] = args.threshold
-            if args.min_threshold is not None:
-                gen_kwargs["min_threshold"] = args.min_threshold
-            if args.editing_threshold is not None:
-                gen_kwargs["editing_threshold"] = args.editing_threshold
-            if args.max_post_steps is not None:
-                gen_kwargs["max_post_steps"] = args.max_post_steps
-            if args.stability_steps is not None:
-                gen_kwargs["stability_steps"] = args.stability_steps
         gen_kwargs.update(diffusion_kwargs_from_args(args, config))
         if draft_model is not None:
             gen_kwargs["draft_model"] = draft_model

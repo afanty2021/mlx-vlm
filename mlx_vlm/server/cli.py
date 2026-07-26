@@ -12,6 +12,7 @@ from ..generate import (
 )
 from .generation import (
     DEFAULT_ENABLE_THINKING,
+    get_log_progress_interval,
     get_server_max_tokens,
     get_server_thinking_budget,
     get_server_thinking_end_token,
@@ -84,6 +85,15 @@ def main():
         type=int,
         default=DEFAULT_PREFILL_STEP_SIZE,
         help="Tokens per prefill step (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--log-progress-interval",
+        type=int,
+        default=get_log_progress_interval(),
+        help=(
+            "Decoded tokens between progress log messages; 0 disables periodic "
+            "decode progress (default: %(default)s)."
+        ),
     )
     parser.add_argument(
         "--max-tokens",
@@ -197,8 +207,8 @@ def main():
         type=str,
         default=None,
         help=(
-            "Optional bearer token required for management endpoints such as "
-            "/health, /metrics, /cache/stats, /cache/reset, and /unload. "
+            "Optional bearer token required for inference, model discovery, and "
+            "management endpoints. "
             "Maps to the MLX_VLM_SERVER_API_KEY env var."
         ),
     )
@@ -237,6 +247,7 @@ def main():
         os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
+    os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
     if args.thinking_budget is not None:

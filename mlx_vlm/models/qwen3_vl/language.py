@@ -10,6 +10,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..mlp import SwiGLUMLP as MLP
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from .config import ModelConfig, TextConfig
@@ -133,17 +134,6 @@ class Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Qwen3VLDecoderLayer(nn.Module):
@@ -420,6 +410,10 @@ class LanguageModel(nn.Module):
 
                     llm_pos_ids_list.append(t_index + st_idx)
 
+                if not llm_pos_ids_list:
+                    mrope_position_deltas.append(0)
+                    continue
+
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
                 compact_max_position = llm_positions.max()
                 padded_positions = [[1] * total_input_ids.shape[1] for _ in range(3)]
@@ -493,6 +487,9 @@ class LanguageModel(nn.Module):
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
+
+        if rope_deltas_kw is not None:
+            self._rope_deltas = rope_deltas_kw
 
         # Use ``cache._idx`` — the Python-int token counter — instead of
         # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
@@ -618,7 +615,11 @@ class LanguageModel(nn.Module):
                     delta = delta.reshape(-1, 1)
 
                 position_ids = mx.add(position_ids, delta)
-                if self._position_ids is not None and self._position_ids.ndim == 3:
+                if (
+                    rope_deltas_kw is not None
+                    or self._position_ids is not None
+                    and self._position_ids.ndim == 3
+                ):
                     position_ids = position_ids[None, ...]
                     position_ids = mx.broadcast_to(
                         position_ids, (3, batch_size, seq_length)
